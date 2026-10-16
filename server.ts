@@ -13,6 +13,7 @@ import { createServer as createViteServer } from 'vite';
 import { dbService } from './src/db/database';
 import { matchSpeciesFromFeatures } from './src/utils/bioacoustics';
 import { cnnEngine } from './src/utils/bioacousticCnnEngine';
+import { validateCoordinates } from './src/utils/geoUtils';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -446,7 +447,7 @@ app.get('/api/species/:id', async (req, res) => {
 // --- Observations REST Endpoints ---
 app.get('/api/observations', async (req, res) => {
   try {
-    const { startDate, endDate, speciesId, location, activityLevel, search } = req.query;
+    const { startDate, endDate, speciesId, location, activityLevel, search, includeDemo } = req.query;
     const observations = await dbService.getObservations({
       startDate: typeof startDate === 'string' ? startDate : undefined,
       endDate: typeof endDate === 'string' ? endDate : undefined,
@@ -454,6 +455,7 @@ app.get('/api/observations', async (req, res) => {
       location: typeof location === 'string' ? location : undefined,
       activityLevel: typeof activityLevel === 'string' ? activityLevel : undefined,
       search: typeof search === 'string' ? search : undefined,
+      includeDemo: includeDemo === 'true',
     });
     res.json(observations);
   } catch (err) {
@@ -491,6 +493,20 @@ app.post('/api/observations', upload.single('audioFile') as any, async (req, res
       return;
     }
 
+    // Strict coordinate validation: -90 <= lat <= 90, -180 <= lng <= 180
+    const coordValidation = validateCoordinates(req.body.latitude, req.body.longitude);
+    if (!coordValidation.valid) {
+      res.status(400).json({ error: coordValidation.error });
+      return;
+    }
+
+    const latitude = coordValidation.latitude;
+    const longitude = coordValidation.longitude;
+    const locationSource =
+      req.body.locationSource ||
+      (latitude !== undefined && longitude !== undefined ? 'manual' : 'unavailable');
+    const isDemo = req.body.isDemo === true || req.body.isDemo === 'true';
+
     const confidence = parseFloat(req.body.confidence) || 0.85;
     const callsDetected = parseInt(req.body.callsDetected, 10) || 0;
     const durationSeconds = parseFloat(req.body.durationSeconds) || 0;
@@ -498,9 +514,7 @@ app.post('/api/observations', upload.single('audioFile') as any, async (req, res
     const activityLevel = req.body.activityLevel || undefined;
     const activityUnavailableReason = req.body.activityUnavailableReason || undefined;
     const ecosystemScoreAtTime = req.body.ecosystemScoreAtTime ? parseInt(req.body.ecosystemScoreAtTime, 10) : undefined;
-    const location = req.body.location || '';
-    const latitude = req.body.latitude ? parseFloat(req.body.latitude) : undefined;
-    const longitude = req.body.longitude ? parseFloat(req.body.longitude) : undefined;
+    const location = req.body.location || (latitude !== undefined ? `Point (${latitude.toFixed(4)}, ${longitude?.toFixed(4)})` : 'Field Station');
     const notes = req.body.notes || '';
     const audioSource = req.body.audioSource || 'sample';
     const peakFrequencyHz = req.body.peakFrequencyHz ? parseFloat(req.body.peakFrequencyHz) : undefined;
@@ -512,6 +526,8 @@ app.post('/api/observations', upload.single('audioFile') as any, async (req, res
       location,
       latitude,
       longitude,
+      locationSource,
+      isDemo,
       confidence,
       notes,
       source: audioSource === 'manual' ? 'manual' : 'classifier',

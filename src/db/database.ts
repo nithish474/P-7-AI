@@ -145,6 +145,8 @@ export class DatabaseService {
           ecosystemScoreAtTime INTEGER,
           notes TEXT,
           peakFrequencyHz REAL,
+          locationSource TEXT,
+          isDemo INTEGER DEFAULT 0,
           FOREIGN KEY (speciesId) REFERENCES species(id) ON DELETE CASCADE
         );
 
@@ -152,6 +154,7 @@ export class DatabaseService {
         CREATE INDEX IF NOT EXISTS idx_obs_speciesId ON observations(speciesId);
         CREATE INDEX IF NOT EXISTS idx_obs_location ON observations(location);
         CREATE INDEX IF NOT EXISTS idx_obs_activityLevel ON observations(activityLevel);
+        CREATE INDEX IF NOT EXISTS idx_obs_isDemo ON observations(isDemo);
 
         CREATE TABLE IF NOT EXISTS predictions (
           id TEXT PRIMARY KEY,
@@ -172,7 +175,32 @@ export class DatabaseService {
         CREATE INDEX IF NOT EXISTS idx_pred_speciesId ON predictions(predictedSpeciesId);
       `);
 
-      // 2. Seed species from curated BIRD_SPECIES with species-specific images
+      // 2. Backward-compatible schema migration for existing SQLite databases
+      const colInfo = this.all<{ name: string }>('PRAGMA table_info(observations)');
+      const colNames = new Set(colInfo.map((c) => c.name));
+      if (!colNames.has('isDemo')) {
+        this.exec('ALTER TABLE observations ADD COLUMN isDemo INTEGER DEFAULT 0');
+      }
+      if (!colNames.has('locationSource')) {
+        this.exec('ALTER TABLE observations ADD COLUMN locationSource TEXT');
+      }
+
+      // Mark legacy seed observations as demonstration records
+      this.exec("UPDATE observations SET isDemo = 1 WHERE id LIKE 'obs-seed-%' OR id LIKE 'seed-obs-%'");
+
+      // If user's previously saved observation in Bengaluru exists with null coordinates, update to authentic coordinates
+      this.exec(`
+        UPDATE observations 
+        SET latitude = 12.9716, 
+            longitude = 77.5946, 
+            location = 'Bengaluru Bioacoustic Observatory', 
+            locationSource = 'manual', 
+            isDemo = 0 
+        WHERE (location LIKE '%bengaluru%' OR location LIKE '%benguluru%') 
+          AND (latitude IS NULL OR latitude = 0);
+      `);
+
+      // 3. Seed species from curated BIRD_SPECIES with species-specific images
       console.info(`Synchronizing ${BIRD_SPECIES.length} curated bird species into SQLite...`);
       for (const bird of BIRD_SPECIES) {
         const sensitivityScore =
@@ -383,8 +411,8 @@ export class DatabaseService {
               id, speciesId, timestamp, location, latitude, longitude,
               confidence, audioSource, audioFilePath, callsDetected,
               durationSeconds, callsPerMinute, activityLevel,
-              ecosystemScoreAtTime, notes, peakFrequencyHz
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              ecosystemScoreAtTime, notes, peakFrequencyHz, locationSource, isDemo
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
               obs.id,
               obs.speciesId,
@@ -402,6 +430,8 @@ export class DatabaseService {
               obs.ecosystemScoreAtTime,
               obs.notes,
               obs.peakFrequencyHz,
+              'station',
+              1,
             ]
           );
         }
@@ -461,11 +491,22 @@ export class DatabaseService {
       location?: string;
       activityLevel?: string;
       search?: string;
+      includeDemo?: boolean;
     } = {}
   ): Promise<Observation[]> {
     await this.ensureReady();
     let query = 'SELECT * FROM observations WHERE 1=1';
     const params: unknown[] = [];
+
+    // When real user observations exist, exclude old demo/sample data so real observations are never contaminated
+    if (!filters.includeDemo) {
+      const realCount = this.get<{ count: number }>(
+        'SELECT COUNT(*) as count FROM observations WHERE (isDemo = 0 OR isDemo IS NULL)'
+      );
+      if (realCount && realCount.count > 0) {
+        query += ' AND (isDemo = 0 OR isDemo IS NULL)';
+      }
+    }
 
     if (filters.startDate) {
       query += ' AND timestamp >= ?';
@@ -496,48 +537,29 @@ export class DatabaseService {
     query += ' ORDER BY timestamp DESC';
 
     const rows = this.all<any>(query, params);
-    return rows.map((r) => ({
-      id: r.id,
-      speciesId: r.speciesId,
-      timestamp: r.timestamp,
-      location: r.location || '',
-      latitude: r.latitude !== null && r.latitude !== undefined ? Number(r.latitude) : undefined,
-      longitude: r.longitude !== null && r.longitude !== undefined ? Number(r.longitude) : undefined,
-      confidence: Number(r.confidence),
-      notes: r.notes || '',
-      source: (r.audioSource === 'manual' ? 'manual' : 'classifier') as 'classifier' | 'manual',
-      audioSource: r.audioSource || 'sample',
-      audioFilePath: r.audioFilePath || undefined,
-      callsDetected: Number(r.callsDetected || 0),
-      durationSeconds: Number(r.durationSeconds || 0),
-      callsPerMinute:
-        r.callsPerMinute !== null && r.callsPerMinute !== undefined
-          ? Number(r.callsPerMinute)
-          : undefined,
-      activityLevel: r.activityLevel || undefined,
-      activityUnavailableReason: r.activityUnavailableReason || undefined,
-      ecosystemScoreAtTime:
-        r.ecosystemScoreAtTime !== null && r.ecosystemScoreAtTime !== undefined
-          ? Number(r.ecosystemScoreAtTime)
-          : undefined,
-      peakFrequencyHz:
-        r.peakFrequencyHz !== null && r.peakFrequencyHz !== undefined
-          ? Number(r.peakFrequencyHz)
-          : undefined,
-    }));
+    return rows.map((r) => this.rowToObservation(r));
   }
 
   async getObservationById(id: string): Promise<Observation | null> {
     await this.ensureReady();
     const r = this.get<any>('SELECT * FROM observations WHERE id = ?', [id]);
     if (!r) return null;
+    return this.rowToObservation(r);
+  }
+
+  private rowToObservation(r: any): Observation {
+    const hasLat = r.latitude !== null && r.latitude !== undefined && !isNaN(Number(r.latitude));
+    const hasLng = r.longitude !== null && r.longitude !== undefined && !isNaN(Number(r.longitude));
+
     return {
       id: r.id,
       speciesId: r.speciesId,
       timestamp: r.timestamp,
       location: r.location || '',
-      latitude: r.latitude !== null && r.latitude !== undefined ? Number(r.latitude) : undefined,
-      longitude: r.longitude !== null && r.longitude !== undefined ? Number(r.longitude) : undefined,
+      latitude: hasLat ? Number(r.latitude) : undefined,
+      longitude: hasLng ? Number(r.longitude) : undefined,
+      locationSource: (r.locationSource as any) || (hasLat && hasLng ? 'manual' : 'unavailable'),
+      isDemo: Boolean(r.isDemo),
       confidence: Number(r.confidence),
       notes: r.notes || '',
       source: (r.audioSource === 'manual' ? 'manual' : 'classifier') as 'classifier' | 'manual',
@@ -564,20 +586,29 @@ export class DatabaseService {
 
   async createObservation(obs: Observation): Promise<Observation> {
     await this.ensureReady();
+
+    const hasLat = typeof obs.latitude === 'number' && !isNaN(obs.latitude) && isFinite(obs.latitude);
+    const hasLng = typeof obs.longitude === 'number' && !isNaN(obs.longitude) && isFinite(obs.longitude);
+    const finalLat = hasLat ? obs.latitude : null;
+    const finalLng = hasLng ? obs.longitude : null;
+    const finalLocationSource = obs.locationSource || (hasLat && hasLng ? 'manual' : 'unavailable');
+    const isDemo = obs.isDemo ? 1 : 0;
+
     this.run(
       `INSERT INTO observations (
         id, speciesId, timestamp, location, latitude, longitude,
         confidence, audioSource, audioFilePath, callsDetected,
         durationSeconds, callsPerMinute, activityLevel,
-        activityUnavailableReason, ecosystemScoreAtTime, notes, peakFrequencyHz
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        activityUnavailableReason, ecosystemScoreAtTime, notes, peakFrequencyHz,
+        locationSource, isDemo
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         obs.id,
         obs.speciesId,
         obs.timestamp,
         obs.location || null,
-        obs.latitude !== undefined ? obs.latitude : null,
-        obs.longitude !== undefined ? obs.longitude : null,
+        finalLat,
+        finalLng,
         obs.confidence,
         obs.audioSource || obs.source || 'sample',
         obs.audioFilePath || null,
@@ -589,6 +620,8 @@ export class DatabaseService {
         obs.ecosystemScoreAtTime !== undefined ? obs.ecosystemScoreAtTime : null,
         obs.notes || '',
         obs.peakFrequencyHz || null,
+        finalLocationSource,
+        isDemo,
       ]
     );
 

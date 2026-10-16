@@ -25,6 +25,8 @@ import {
 import { playBirdCall } from '../utils/audioSynth';
 import '../utils/azureMapsLeaflet';
 import { AuthenticationOptions, AzureMapsTilesetId } from '../utils/azureMapsLeaflet';
+import { KNOWN_MONITORING_STATIONS } from '../data/stations';
+import { calculateMapExtent, formatCoordinatePair, getValidObservations } from '../utils/geoUtils';
 
 export type MapColorMode = 'activity' | 'iucn' | 'sensitivity';
 export type MapTileProvider =
@@ -46,17 +48,6 @@ export interface ObservationMapProps {
   defaultTileProvider?: MapTileProvider;
   showToolbar?: boolean;
 }
-
-// Preset monitoring stations for quick navigation (including Pacific Northwest Reserve & London Bioacoustic Hub)
-const MONITORING_STATIONS = [
-  { name: 'Pine Ridge Canopy Station', lat: 45.5231, lng: -122.6765, desc: 'Mature Douglas-fir canopy' },
-  { name: 'Cedar Creek Understory', lat: 45.5345, lng: -122.6892, desc: 'Riparian wetland buffer' },
-  { name: 'Oak Savannah Edge', lat: 45.5122, lng: -122.6543, desc: 'Garry oak open woodland' },
-  { name: 'High Ridge Old Growth', lat: 45.5411, lng: -122.7012, desc: 'Western hemlock ridge' },
-  { name: 'Riparian Forest Reserve', lat: 45.5089, lng: -122.6419, desc: 'Floodplain willow habitat' },
-  { name: 'North Slope Snag Grove', lat: 45.5312, lng: -122.6681, desc: 'Standing dead snag zone' },
-  { name: 'London Bioacoustic Sensor', lat: 51.505, lng: -0.09, desc: 'Urban bioacoustic telemetry hub' },
-];
 
 // Tile layers configurations: Genuine OpenTopoMap Terrain default, Dark, OSM, and Satellite layers
 const TILE_LAYERS: Record<
@@ -293,30 +284,10 @@ export const ObservationMap: React.FC<ObservationMapProps> = ({
   const speciesMap = useMemo(() => new Map(speciesList.map((s) => [s.id, s])), [speciesList]);
 
   // Strictly filter observations that have valid coordinates
-  const validObservations = useMemo(() => {
-    return observations.filter(
-      (o) =>
-        typeof o.latitude === 'number' &&
-        typeof o.longitude === 'number' &&
-        !isNaN(o.latitude) &&
-        !isNaN(o.longitude) &&
-        (o.latitude !== 0 || o.longitude !== 0)
-    );
-  }, [observations]);
+  const validObservations = useMemo(() => getValidObservations(observations), [observations]);
 
-  // Determine center coordinates
-  const defaultCenter = useMemo<[number, number]>(() => {
-    if (validObservations.length > 0) {
-      const avgLat =
-        validObservations.reduce((acc, o) => acc + (o.latitude as number), 0) /
-        validObservations.length;
-      const avgLng =
-        validObservations.reduce((acc, o) => acc + (o.longitude as number), 0) /
-        validObservations.length;
-      return [avgLat, avgLng];
-    }
-    return [45.5231, -122.6765]; // Pacific Northwest Bioacoustics baseline
-  }, [validObservations]);
+  // Determine geographic extent, center, and zoom based on actual displayed observations
+  const mapExtent = useMemo(() => calculateMapExtent(validObservations), [validObservations]);
 
   // Helper to instantiate active TileLayer (Azure Maps Leaflet plugin or standard OSM)
   const createTileLayerInstance = useCallback(
@@ -416,8 +387,8 @@ export const ObservationMap: React.FC<ObservationMapProps> = ({
 
     // Connect map with leaflet: var map = L.map(container).setView(center, 13)
     const map = L.map(mapContainerRef.current, {
-      center: defaultCenter,
-      zoom: 12,
+      center: mapExtent.center,
+      zoom: mapExtent.zoom,
       scrollWheelZoom: true,
       zoomControl: true,
     });

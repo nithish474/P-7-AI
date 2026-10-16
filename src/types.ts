@@ -119,6 +119,8 @@ export interface Observation {
   activityUnavailableReason?: string;
   ecosystemScoreAtTime?: number;
   peakFrequencyHz?: number;
+  locationSource?: 'gps' | 'manual' | 'map' | 'station' | 'unavailable';
+  isDemo?: boolean;
 }
 
 export interface BiodiversityMetrics {
